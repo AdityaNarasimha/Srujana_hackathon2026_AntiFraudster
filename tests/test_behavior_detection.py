@@ -90,3 +90,20 @@ def test_empty_input_returns_empty_result():
     assert result.empty
     assert "rapid_transfer_flag" in result.columns
     assert "new_recipient_flag" in result.columns
+
+
+def test_early_warning_starts_on_second_transfer(sample_transactions):
+    result = detect_behavior(
+        sample_transactions,
+        min_history_transactions=0,
+    )
+
+    # First transfer: no early warning.
+    assert not result.loc[0, "early_transfer_warning_flag"]
+
+    # Second transfer: early warning begins.
+    assert result.loc[1, "early_transfer_warning_flag"]
+
+    # Third transfer: both early warning and rapid-transfer flag.
+    assert result.loc[2, "early_transfer_warning_flag"]
+    assert result.loc[2, "rapid_transfer_flag"]
