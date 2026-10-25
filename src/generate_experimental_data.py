@@ -12,7 +12,6 @@ N_NORMAL = 900
 START = pd.Timestamp("2026-09-01")
 END = pd.Timestamp("2026-10-01")
 
-# Fictional location identifiers for the prototype.
 LOCATIONS = [
     "LOC-001",
     "LOC-002",
@@ -20,6 +19,10 @@ LOCATIONS = [
     "LOC-004",
     "LOC-005",
 ]
+
+RAPID_WINDOW_MINUTES = 5
+RAPID_BURST_COUNT = 25
+TRANSACTIONS_PER_BURST = 3
 
 
 def generate_experimental_data() -> pd.DataFrame:
@@ -35,7 +38,7 @@ def generate_experimental_data() -> pd.DataFrame:
         for customer in range(1, N_CUSTOMERS + 1)
     }
 
-    # Generate normal transaction histories first.
+    # 1. Generate legitimate baseline history.
     for _ in range(N_NORMAL):
         sender_num = int(rng.integers(1, N_CUSTOMERS + 1))
         sender = f"ACC-{sender_num:03d}"
@@ -64,25 +67,23 @@ def generate_experimental_data() -> pd.DataFrame:
         })
         transaction_number += 1
 
-    # Find senders with enough existing history to test
-    # first-time recipients fairly.
     normal_df = pd.DataFrame(rows)
-    eligible_history = {}
+
+    # 2. Find customers with sufficient legitimate history.
+    eligible_senders = []
 
     for sender, group in normal_df.groupby("sender_id"):
-        times = group["timestamp"].sort_values().tolist()
+        if len(group) >= 5:
+            eligible_senders.append(sender)
 
-        if len(times) >= 5:
-            eligible_history[sender] = times
-
-    if not eligible_history:
+    if not eligible_senders:
         raise RuntimeError(
             "Not enough sender history for new-recipient scenarios."
         )
 
+    # 3. Generate non-rapid scenarios first.
     scenario_names = (
         ["unusual_amount"] * 25
-        + ["rapid_transfers"] * 25
         + ["new_recipient"] * 25
         + ["large_legitimate"] * 15
         + ["nighttime_legitimate"] * 10
@@ -101,9 +102,7 @@ def generate_experimental_data() -> pd.DataFrame:
             )
         )
 
-        receiver = str(
-            rng.choice(normal_receivers[sender_num])
-        )
+        receiver = str(rng.choice(normal_receivers[sender_num]))
         amount = round(
             float(rng.lognormal(mean=4.5, sigma=0.65)), 2
         )
@@ -113,49 +112,24 @@ def generate_experimental_data() -> pd.DataFrame:
         if scenario == "unusual_amount":
             amount = round(float(rng.uniform(5000, 15000)), 2)
 
-        elif scenario == "rapid_transfers":
-            # Three transactions from one sender within four minutes.
-            timestamp = START + pd.Timedelta(
-                minutes=int(rng.integers(0, 29 * 24 * 60))
-            )
-
-            for offset in range(3):
-                rows.append({
-                    "transaction_id": (
-                        f"TXN-{transaction_number:05d}"
-                    ),
-                    "timestamp": timestamp
-                    + pd.Timedelta(minutes=offset * 2),
-                    "sender_id": sender,
-                    "receiver_id": (
-                        f"RAPID-{transaction_number:05d}"
-                    ),
-                    "amount": round(
-                        float(rng.uniform(50, 300)), 2
-                    ),
-                    "location_id": location_id,
-                    "is_fraud": 1,
-                    "scenario": "rapid_transfers",
-                })
-                transaction_number += 1
-
-            continue
-
         elif scenario == "new_recipient":
-            # Select a sender with at least five earlier normal
-            # transactions, then place this transaction after them.
-            sender = str(rng.choice(list(eligible_history)))
-            sender_history = eligible_history[sender]
-
-            fifth_history_time = sender_history[4]
-            timestamp = fifth_history_time + pd.Timedelta(seconds=1)
-
-            # Ensure the generated event remains in the test period.
-            if timestamp >= END:
-                timestamp = END - pd.Timedelta(minutes=1)
+            # Select a sender with at least five normal transactions.
+            sender = str(rng.choice(eligible_senders))
+            sender_num = int(sender.split("-")[1])
 
             receiver = f"NEW-{transaction_number:05d}"
             amount = round(float(rng.uniform(100, 1000)), 2)
+
+            # Place the event after the sender's latest normal event.
+            sender_normal = normal_df[
+                normal_df["sender_id"] == sender
+            ]
+            latest_normal_time = sender_normal["timestamp"].max()
+
+            # Keep the event inside the generated time period.
+            timestamp = latest_normal_time + pd.Timedelta(seconds=1)
+            if timestamp >= END:
+                timestamp = END - pd.Timedelta(seconds=1)
 
         elif scenario == "large_legitimate":
             amount = round(float(rng.uniform(5000, 15000)), 2)
@@ -179,15 +153,112 @@ def generate_experimental_data() -> pd.DataFrame:
         })
         transaction_number += 1
 
+    # 4. Generate rapid bursts last. Choose sender/time combinations
+    # that do not overlap existing transactions from the same sender.
+    existing = pd.DataFrame(rows)
+    rapid_bursts_created = 0
+    attempts = 0
+    max_attempts = 100_000
+
+    while (
+        rapid_bursts_created < RAPID_BURST_COUNT
+        and attempts < max_attempts
+    ):
+        attempts += 1
+
+        sender_num = int(rng.integers(1, N_CUSTOMERS + 1))
+        sender = f"ACC-{sender_num:03d}"
+
+        # Allow the full four-minute burst to finish before END.
+        latest_start = END - pd.Timedelta(minutes=4)
+        available_minutes = int(
+            (latest_start - START).total_seconds() // 60
+        )
+        start_time = START + pd.Timedelta(
+            minutes=int(rng.integers(0, available_minutes + 1))
+        )
+
+        # Check the complete five-minute window, not just exact
+        # timestamp matches, against all existing same-sender events.
+        sender_times = pd.to_datetime(
+            existing.loc[
+                existing["sender_id"] == sender, "timestamp"
+            ]
+        )
+
+        window_start = start_time - pd.Timedelta(
+            minutes=RAPID_WINDOW_MINUTES
+        )
+        window_end = start_time + pd.Timedelta(
+            minutes=RAPID_WINDOW_MINUTES
+        )
+
+        overlaps = (
+            (sender_times >= window_start)
+            & (sender_times <= window_end)
+        ).any()
+
+        if overlaps:
+            continue
+
+        location_id = str(rng.choice(LOCATIONS))
+
+        for offset in range(TRANSACTIONS_PER_BURST):
+            timestamp = start_time + pd.Timedelta(
+                minutes=offset * 2
+            )
+
+            rows.append({
+                "transaction_id": f"TXN-{transaction_number:05d}",
+                "timestamp": timestamp,
+                "sender_id": sender,
+                "receiver_id": f"RAPID-{transaction_number:05d}",
+                "amount": round(float(rng.uniform(50, 300)), 2),
+                "location_id": location_id,
+                "is_fraud": 1,
+                "scenario": "rapid_transfers",
+            })
+            transaction_number += 1
+
+        rapid_bursts_created += 1
+
+        # Update the lookup so later bursts cannot overlap this burst.
+        new_rows = rows[-TRANSACTIONS_PER_BURST:]
+        existing = pd.concat(
+            [existing, pd.DataFrame(new_rows)],
+            ignore_index=True,
+        )
+
+    if rapid_bursts_created != RAPID_BURST_COUNT:
+        raise RuntimeError(
+            "Could not generate all rapid-transfer bursts "
+            "without sender/time overlap."
+        )
+
+    # 5. Validate and save.
     df = pd.DataFrame(rows)
     df = df.sort_values(
         ["timestamp", "transaction_id"]
     ).reset_index(drop=True)
 
+    assert len(df) == 1050, f"Unexpected row count: {len(df)}"
     assert df["transaction_id"].is_unique
     assert df["amount"].ge(0).all()
     assert df["is_fraud"].isin([0, 1]).all()
     assert df["location_id"].notna().all()
+
+    expected_counts = {
+        "normal": 900,
+        "rapid_transfers": 75,
+        "new_recipient": 25,
+        "unusual_amount": 25,
+        "large_legitimate": 15,
+        "nighttime_legitimate": 10,
+    }
+    actual_counts = df["scenario"].value_counts().to_dict()
+    assert actual_counts == expected_counts, (
+        f"Unexpected scenario counts: {actual_counts}"
+    )
 
     output_path = Path("data/experimental_transactions.csv")
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -205,6 +276,4 @@ if __name__ == "__main__":
     print(data["scenario"].value_counts())
     print("\nLabel counts:")
     print(data["is_fraud"].value_counts())
-    print("\nLocation counts:")
-    print(data["location_id"].value_counts())
     print("\nSaved to data/experimental_transactions.csv")

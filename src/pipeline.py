@@ -1,5 +1,4 @@
 
-
 import pandas as pd
 
 from src.detection import detect_fraud
@@ -16,148 +15,188 @@ def analyze_transactions(
     transactions: pd.DataFrame,
     customers: pd.DataFrame,
 ) -> pd.DataFrame:
-    """
-    Combine transaction, customer, behavior, spending, timing,
-    recipient relationship, location and network signals.
+    """Run the AntiFraudster transaction-risk analysis pipeline."""
 
-    Scores are demo heuristics, not fraud probabilities.
-    Review signals do not prove fraud.
-    """
+    required_columns = {
+        "transaction_id",
+        "sender_id",
+        "receiver_id",
+        "amount",
+    }
 
-    # 1. Transaction-level detection.
-    detected = detect_fraud(transactions)
+    missing = required_columns - set(transactions.columns)
+    if missing:
+        raise ValueError(
+            f"Missing transaction columns: {sorted(missing)}"
+        )
 
-    # 2. Behavior detection.
-    if "timestamp" in detected.columns:
-        behavior = detect_behavior(detected)
+    profiled = detect_fraud(transactions)
+
+    # Behavioral analysis
+    if "timestamp" in profiled.columns:
+        profiled = detect_behavior(profiled)
     else:
-        behavior = detected.copy()
-        behavior["rapid_transfer_flag"] = False
-        behavior["new_recipient_flag"] = False
-        behavior["behavior_reasons"] = ""
+        profiled["early_transfer_warning_flag"] = False
+        profiled["rapid_transfer_flag"] = False
+        profiled["rapid_burst_review_flag"] = False
+        profiled["new_recipient_flag"] = False
+        profiled["behavior_reasons"] = ""
 
-    # 3. Personal spending baseline.
-    profiled = detect_spending_baseline(behavior)
+    # Spending-pattern analysis
+    profiled = detect_spending_baseline(profiled)
 
-    # 4. Personal timing baseline.
+    # Timing analysis
     if "timestamp" in profiled.columns:
         profiled = detect_timing_anomalies(profiled)
     else:
         profiled["unusual_time_flag"] = False
-        profiled["historical_timing_count"] = 0
-        profiled["historical_active_hours"] = ""
-        profiled["timing_reason"] = (
-            "Timestamp unavailable; timing not assessed"
-        )
+        profiled["timing_reason"] = ""
 
-    # 5. Recipient relationship history.
+    # Recipient relationship analysis
     if "timestamp" in profiled.columns:
         profiled = detect_recipient_relationships(profiled)
     else:
-        # Relationship history requires chronological ordering.
-        # Without timestamps, preserve existing new-recipient signals
-        # and explicitly mark relationship analysis as unavailable.
-        profiled["recipient_prior_transaction_count"] = 0
-        profiled["recipient_prior_total_amount"] = 0.0
-        profiled["recipient_prior_average_amount"] = float("nan")
-        profiled["recipient_relationship_new"] = False
         profiled["recipient_amount_deviation_flag"] = False
-        profiled["recipient_relationship_reason"] = (
-            "Timestamp unavailable; relationship history not assessed"
-        )
+        profiled["recipient_relationship_reason"] = ""
 
-    # 6. Customer profile context.
+    # Customer profile risk
     profiled = assess_customer_risk(profiled, customers)
 
-    # 7. Behavior risk points.
-    profiled["behavior_risk_points"] = (
-        profiled["rapid_transfer_flag"].astype(int) * 25
-        + profiled["new_recipient_flag"].astype(int) * 10
+    # Behavioral risk points
+    rapid_flag = (
+        profiled["rapid_transfer_flag"]
+        .fillna(False)
+        .astype(bool)
+    )
+    new_recipient_flag = (
+        profiled["new_recipient_flag"]
+        .fillna(False)
+        .astype(bool)
+    )
+
+    behavior_points = (
+        rapid_flag.astype(int) * 25
+        + new_recipient_flag.astype(int) * 10
     ).clip(upper=35)
 
-    # 8. Review-oriented score contributions.
-    profiled["spending_baseline_risk_points"] = (
-        profiled["spending_change_flag"].astype(int) * 15
+    # Spending risk points
+    spending_flag = (
+        profiled["spending_change_flag"]
+        .fillna(False)
+        .astype(bool)
     )
+    spending_points = spending_flag.astype(int) * 15
 
-    profiled["timing_risk_points"] = (
-        profiled["unusual_time_flag"].astype(int) * 10
+    # Timing risk points
+    unusual_time_flag = (
+        profiled["unusual_time_flag"]
+        .fillna(False)
+        .astype(bool)
     )
+    timing_points = unusual_time_flag.astype(int) * 10
 
-    # Recipient amount deviation is a separate review signal.
-    profiled["recipient_relationship_risk_points"] = (
-        profiled["recipient_amount_deviation_flag"].astype(int) * 10
+    # Recipient amount deviation points
+    recipient_deviation_flag = (
+        profiled["recipient_amount_deviation_flag"]
+        .fillna(False)
+        .astype(bool)
     )
+    recipient_points = recipient_deviation_flag.astype(int) * 10
 
-    # 9. Combined heuristic score.
+    # Combined risk score
     profiled["combined_risk_score"] = (
         profiled["risk_score"]
         + profiled["profile_risk_points"]
-        + profiled["behavior_risk_points"]
-        + profiled["spending_baseline_risk_points"]
-        + profiled["timing_risk_points"]
-        + profiled["recipient_relationship_risk_points"]
+        + behavior_points
+        + spending_points
+        + timing_points
+        + recipient_points
     ).clip(upper=100)
 
-    profiled["combined_risk_level"] = pd.cut(
+    profiled["risk_level"] = pd.cut(
         profiled["combined_risk_score"],
-        bins=[-1, 19, 49, 79, 100],
+        bins=[-1, 24, 49, 74, 100],
         labels=["Low", "Medium", "High", "Critical"],
     ).astype(str)
 
-    # 10. Location review signals.
-    if (
-        "timestamp" in profiled.columns
-        and "location_id" in profiled.columns
-    ):
+    profiled["combined_risk_level"] = profiled["risk_level"]
+
+    # Location analysis
+    if "timestamp" in profiled.columns and "location_id" in profiled.columns:
         profiled = detect_location_anomalies(profiled)
     else:
         profiled["location_anomaly_flag"] = False
-        profiled["location_distance_km"] = float("nan")
-        profiled["location_elapsed_minutes"] = float("nan")
         profiled["location_reason"] = ""
 
-    # 11. Network review signals.
+    # Network analysis
     profiled = detect_network_risks(profiled)
 
-    # 12. Human review recommendation.
+    # Compliance review signal
+    profiled["compliance_review_required"] = (
+        profiled["profile_review_required"]
+        .fillna(False)
+        .astype(bool)
+    )
+
+    # Candidate fraud prediction:
+    # includes the new causal early-warning signal.
+    profiled["predicted_fraud"] = (
+        profiled["combined_risk_score"].ge(50)
+        | rapid_flag
+        | profiled["early_transfer_warning_flag"]
+            .fillna(False).astype(bool)
+        | profiled["spending_baseline_review"]
+            .fillna(False).astype(bool)
+        | recipient_deviation_flag
+        | profiled["location_anomaly_flag"]
+            .fillna(False).astype(bool)
+        | profiled["network_review_signal"]
+            .fillna(False).astype(bool)
+    )
+
+    # Human review can be broader than the fraud prediction.
     profiled["needs_human_review"] = (
         profiled["combined_risk_score"].ge(50)
         | profiled["profile_review_required"]
-        | profiled["rapid_transfer_flag"]
+            .fillna(False).astype(bool)
+        | rapid_flag
+        | new_recipient_flag
         | profiled["spending_baseline_review"]
-        | profiled["unusual_time_flag"]
-        | profiled["recipient_amount_deviation_flag"]
+            .fillna(False).astype(bool)
+        | recipient_deviation_flag
         | profiled["location_anomaly_flag"]
+            .fillna(False).astype(bool)
         | profiled["network_review_signal"]
+            .fillna(False).astype(bool)
     )
 
-    # 13. Collect additional review reasons.
+    # Collect review explanations
     reason_columns = [
-        "spending_change_reason",
+        "spending_baseline_reason",
         "timing_reason",
         "recipient_relationship_reason",
         "location_reason",
-        "network_reason",
+        "network_review_reason",
     ]
 
-    reasons = []
-    for _, row in profiled[reason_columns].fillna("").iterrows():
-        parts = [
-            str(row[column]).strip()
-            for column in reason_columns
-            if str(row[column]).strip()
-            and str(row[column]).strip() not in {
-                "No spending-baseline deviation detected",
-                "Insufficient personal spending history",
-                "Insufficient personal timing history",
-                "Transaction hour observed in prior history",
-                "Timestamp unavailable; timing not assessed",
-                "Timestamp unavailable; relationship history not assessed",
-            }
-        ]
-        reasons.append("; ".join(parts))
+    available_reason_columns = [
+        column for column in reason_columns
+        if column in profiled.columns
+    ]
 
-    profiled["additional_review_reasons"] = reasons
+    if available_reason_columns:
+        profiled["additional_review_reasons"] = (
+            profiled[available_reason_columns]
+            .fillna("")
+            .astype(str)
+            .apply(
+                lambda row: "; ".join(
+                    value for value in row if value.strip()
+                ),
+                axis=1,
+            )
+        )
+    else:
+        profiled["additional_review_reasons"] = ""
 
     return profiled
